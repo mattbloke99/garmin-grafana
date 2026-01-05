@@ -55,7 +55,7 @@ RATE_LIMIT_CALLS_SECONDS = int(os.getenv("RATE_LIMIT_CALLS_SECONDS", 5)) # optio
 INFLUXDB_ENDPOINT_IS_HTTP = False if os.getenv("INFLUXDB_ENDPOINT_IS_HTTP") in ['False','false','FALSE','f','F','no','No','NO','0'] else True # optional
 GARMIN_DEVICENAME_AUTOMATIC = False if GARMIN_DEVICENAME != "Unknown" else True # optional
 UPDATE_INTERVAL_SECONDS = int(os.getenv("UPDATE_INTERVAL_SECONDS", 300)) # optional
-FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity which you can add to the list seperated by , without any space
+FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,climbing,training_readiness") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity,climbing which you can add to the list seperated by , without any space
 LACTATE_THRESHOLD_SPORTS = os.getenv("LACTATE_THRESHOLD_SPORTS", "RUNNING").upper().split(",") # Garmin currently implements RUNNING, but has provisions for CYCLING, and SWIMMING
 KEEP_FIT_FILES = True if os.getenv("KEEP_FIT_FILES") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional
 FIT_FILE_STORAGE_LOCATION = os.getenv("FIT_FILE_STORAGE_LOCATION", os.path.join(os.path.expanduser("~"), "fit_filestore"))
@@ -627,10 +627,16 @@ def get_activity_summary(date_str):
     activity_with_gps_id_dict = {}
     activity_list = garmin_obj.get_activities_by_date(date_str, date_str)
     for activity in activity_list:
-        if activity.get('hasPolyline') or ALWAYS_PROCESS_FIT_FILES: # will process FIT files lacking GPS data if ALWAYS_PROCESS_FIT_FILES is set to True
+        activity_type_key = (activity.get('activityType') or {}).get('typeKey', "Unknown")
+        is_climbing_activity = 'climbing' in activity_type_key.lower() if activity_type_key else False
+
+        if activity.get('hasPolyline') or ALWAYS_PROCESS_FIT_FILES or is_climbing_activity:
             if not activity.get('hasPolyline'):
-                logging.warning(f"Activity ID {activity.get('activityId')} got no GPS data - yet, activity FIT file data will be processed as ALWAYS_PROCESS_FIT_FILES is on")
-            activity_with_gps_id_dict[activity.get('activityId')] = (activity.get('activityType') or {}).get('typeKey', "Unknown")
+                if is_climbing_activity:
+                    logging.info(f"Activity ID {activity.get('activityId')} is a climbing activity - processing FIT file even without GPS data")
+                else:
+                    logging.warning(f"Activity ID {activity.get('activityId')} got no GPS data - yet, activity FIT file data will be processed as ALWAYS_PROCESS_FIT_FILES is on")
+            activity_with_gps_id_dict[activity.get('activityId')] = activity_type_key
         if "startTimeGMT" in activity: # "startTimeGMT" should be available for all activities (fix #13)
             points_list.append({
                 "measurement":  "ActivitySummary",
@@ -743,7 +749,9 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Fractional_Cadence": parsed_record.get('fractional_cadence', None),
                                     "Temperature": parsed_record.get('temperature', None),
                                     "Accumulated_Power": parsed_record.get('accumulated_power', None),
-                                    "Power": parsed_record.get('power', None)
+                                    "Power": parsed_record.get('power', None),
+                                    "Grade": parsed_record.get('grade', None),
+                                    "Vertical_Speed": parsed_record.get('vertical_speed', None)
                                 }
                             }
                             points_list.append(point)
@@ -771,7 +779,12 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Aerobic_Training": session_record.get('total_training_effect', None),
                                     "Anaerobic_Training": session_record.get('total_anaerobic_training_effect', None),
                                     "Primary_Benefit": session_record.get('primary_benefit', None),
-                                    "Recovery_Time": session_record.get('recovery_time', None)
+                                    "Recovery_Time": session_record.get('recovery_time', None),
+                                    "Total_Ascent": session_record.get('total_ascent', None),
+                                    "Total_Descent": session_record.get('total_descent', None),
+                                    "Total_Calories": session_record.get('total_calories', None),
+                                    "Enhanced_Avg_Speed": session_record.get('enhanced_avg_speed', None),
+                                    "Enhanced_Max_Speed": session_record.get('enhanced_max_speed', None)
                                 }
                             }
                             points_list.append(point)
@@ -830,10 +843,24 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Avg_HR": lap_record.get('avg_heart_rate', None),
                                     "Max_HR": lap_record.get('max_heart_rate', None),
                                     "Avg_Cadence": lap_record.get('avg_cadence', None),
-                                    "Avg_Temperature": lap_record.get('avg_temperature', None)
+                                    "Avg_Temperature": lap_record.get('avg_temperature', None),
+                                    "Total_Ascent": lap_record.get('total_ascent', None),
+                                    "Total_Descent": lap_record.get('total_descent', None),
+                                    "Max_Altitude": lap_record.get('enhanced_max_altitude', None),
+                                    "Min_Altitude": lap_record.get('enhanced_min_altitude', None)
                                 }
                             }
                             points_list.append(point)
+
+                    # Process Indoor Climbing specific data from message 312
+                    if 'climbing' in activity_type.lower() or any(session.get('sport') in ['climbing', 'rock_climbing', 'indoor_climbing'] for session in all_sessions_list):
+                        logging.info(f"Processing : Indoor Climbing activity detected for Activity ID {activityID}")
+                        # Extract climbing routes from FIT file message 312
+                        # Create a fresh buffer from the fit_data as the previous buffer may be closed
+                        climbing_fit_buffer = io.BytesIO(fit_data)
+                        climbing_points = get_climbing_stats(activityID, climbing_fit_buffer)
+                        points_list.extend(climbing_points)
+
                     if KEEP_FIT_FILES:
                         os.makedirs(FIT_FILE_STORAGE_LOCATION, exist_ok=True)
                         fit_path = os.path.join(FIT_FILE_STORAGE_LOCATION, activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type + ".fit")
@@ -1203,6 +1230,131 @@ def get_solar_intensity(date_str):
         logging.warning(f"No Solar Intensity data available for date {date_str}")
     return points_list
 
+def get_climbing_stats(activity_id, fit_file_buffer):
+    """
+    Extract climbing route data from FIT file message 312.
+
+    Args:
+        activity_id: The Garmin activity ID
+        fit_file_buffer: BytesIO buffer containing the FIT file data
+
+    Returns:
+        List of InfluxDB points for climbing routes
+    """
+
+    def map_grade_to_french(grade_value):
+        """
+        Map numeric grade value to French climbing grade.
+        French system: 5a, 5b, 5c, 6a, 6a+, 6b, 6b+, 6c, 6c+, 7a, 7a+, ...up to 9a
+
+        Args:
+            grade_value: Numeric grade from FIT file (field 70)
+
+        Returns:
+            String representation of French grade (e.g., "6b+")
+        """
+        if grade_value is None or grade_value < 6:
+            return None
+
+        # Define the grade progression
+        # Index 0-2: 5a, 5b, 5c (no + variants for grade 5)
+        # Index 3+: 6a, 6a+, 6b, 6b+, 6c, 6c+, 7a, 7a+, ...
+        grades = ['5a', '5b', '5c']  # indices 0-2 (values 6-8)
+
+        # For grades 6-9, each has 6 variants: a, a+, b, b+, c, c+
+        for num in range(6, 10):  # 6, 7, 8, 9
+            for letter in ['a', 'b', 'c']:
+                grades.append(f'{num}{letter}')
+                grades.append(f'{num}{letter}+')
+
+        index = grade_value - 6
+        if 0 <= index < len(grades):
+            return grades[index]
+
+        return f"Unknown({grade_value})"
+
+    points_list = []
+
+    try:
+        from fitparse import FitFile
+
+        # Parse the FIT file
+        fitfile = FitFile(fit_file_buffer)
+        fitfile.parse()
+
+        # Get message 312 (climbing route data)
+        messages_312 = [record.get_values() for record in fitfile.get_messages('unknown_312')]
+
+        if not messages_312:
+            logging.debug(f"No message 312 found in FIT file for activity {activity_id}")
+            return points_list
+
+        logging.info(f"Processing : Found {len(messages_312)} climbing records in message 312 for activity {activity_id}")
+
+        # Get activity start time for reference
+        sessions = [record.get_values() for record in fitfile.get_messages('session')]
+        activity_start_time = sessions[0].get('start_time').replace(tzinfo=pytz.UTC) if sessions else None
+
+        # Process each climbing record
+        for climb_msg in messages_312:
+            climb_type = climb_msg.get('unknown_0')  # 9 = Climb, 10 = Rest
+
+            # Skip rest periods - only process climbs
+            if climb_type != 9:
+                continue
+
+            grade_value = climb_msg.get('unknown_70')  # Grade field
+            duration_ms = climb_msg.get('unknown_1')  # Duration in milliseconds
+            max_hr = climb_msg.get('unknown_16')  # Max heart rate
+            status = climb_msg.get('unknown_71')  # Completed or Attempted
+            falls = climb_msg.get('unknown_72')  # Number of falls
+            sent = climb_msg.get('unknown_73')  # Route sent indicator
+            timestamp_raw = climb_msg.get('unknown_27')  # Garmin timestamp
+
+            # Convert timestamp (Garmin time format: seconds since 1989-12-31)
+            if timestamp_raw:
+                climb_time = (datetime(1989, 12, 31) + timedelta(seconds=timestamp_raw)).replace(tzinfo=pytz.UTC)
+            elif activity_start_time:
+                climb_time = activity_start_time
+            else:
+                continue  # Skip if no timestamp available
+
+            # Map grade to French system
+            grade = map_grade_to_french(grade_value)
+
+            # Convert duration from milliseconds to seconds
+            duration_seconds = round(duration_ms / 1000.0, 0) if duration_ms is not None else None
+
+            # Create InfluxDB point with only requested fields
+            point = {
+                "measurement": "ClimbingRoutes",
+                "time": climb_time.isoformat(),
+                "tags": {
+                    "ActivityID": activity_id
+                },
+                "fields": {
+                    "Duration": duration_seconds,
+                    "MaxHeartRate": max_hr if max_hr is not None else None,
+                    "Grade": grade,
+                    "Falls": falls if falls is not None else 0,
+                    "Sent": True if sent == 1 else False,
+                    "Status": "Completed" if status == 3 else "Attempted"
+                
+                }
+            }
+            points_list.append(point)
+
+        # Log summary
+        climbs = sum(1 for m in messages_312 if m.get('unknown_0') == 9)
+        logging.info(f"Success : Extracted {climbs} climbs from activity {activity_id}")
+
+    except Exception as err:
+        logging.error(f"Error extracting climbing stats from FIT file for activity {activity_id}: {err}")
+        import traceback
+        traceback.print_exc()
+
+    return points_list
+
 
 # %%
 def daily_fetch_write(date_str):
@@ -1354,4 +1506,3 @@ else:
             logging.info(f"No new data found : Current watch and influxdb sync time is {last_watch_sync_time_UTC} UTC")
         logging.info(f"waiting for {UPDATE_INTERVAL_SECONDS} seconds before next automatic update calls")
         time.sleep(UPDATE_INTERVAL_SECONDS)
-
