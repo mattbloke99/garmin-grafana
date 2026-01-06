@@ -10,7 +10,12 @@ COPY pyproject.toml /app/
 COPY uv.lock /app/
 
 WORKDIR /app
-RUN uv sync --locked
+
+# Pre-install setuptools and wheel to avoid build issues on ARM64
+RUN uv pip install --system setuptools wheel
+
+# Sync dependencies with retries for ARM64 builds
+RUN uv sync --locked || uv sync --locked || uv sync --locked
 
 RUN groupadd --gid 1000 appuser && useradd --uid 1000 --gid appuser --shell /bin/bash --create-home appuser && chown -R appuser:appuser /app
 USER appuser

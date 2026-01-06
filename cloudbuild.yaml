@@ -1,0 +1,37 @@
+steps:
+  # Step 1: Set up Docker Buildx for multi-platform builds
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'buildx'
+      - 'create'
+      - '--name'
+      - 'mybuilder'
+      - '--use'
+    id: 'setup-buildx'
+
+  # Step 2: Bootstrap the builder (needed for arm64 emulation)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'buildx'
+      - 'inspect'
+      - '--bootstrap'
+    id: 'bootstrap-buildx'
+
+  # Step 3: Build for ARM64 and push to GCR
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'buildx'
+      - 'build'
+      - '--platform=linux/arm64'
+      - '--tag=gcr.io/$PROJECT_ID/garmin-fetch-data:$BUILD_ID'
+      - '--tag=gcr.io/$PROJECT_ID/garmin-fetch-data:latest'
+      - '--push'
+      - '.'
+    id: 'build-arm64'
+
+# Build options
+options:
+  machineType: 'N1_HIGHCPU_8'  # Use a more powerful machine for ARM64 builds
+  logging: CLOUD_LOGGING_ONLY
+
+# Note: Images are pushed directly by buildx, no need to track them here
