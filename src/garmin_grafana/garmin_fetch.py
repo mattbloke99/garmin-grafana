@@ -628,12 +628,12 @@ def get_activity_summary(date_str):
     activity_list = garmin_obj.get_activities_by_date(date_str, date_str)
     for activity in activity_list:
         activity_type_key = (activity.get('activityType') or {}).get('typeKey', "Unknown")
-        is_climbing_activity = 'climbing' in activity_type_key.lower() if activity_type_key else False
+        is_climbing_activity = ('climbing' in activity_type_key.lower() or 'bouldering' in activity_type_key.lower()) if activity_type_key else False
 
         if activity.get('hasPolyline') or ALWAYS_PROCESS_FIT_FILES or is_climbing_activity:
             if not activity.get('hasPolyline'):
                 if is_climbing_activity:
-                    logging.info(f"Activity ID {activity.get('activityId')} is a climbing activity - processing FIT file even without GPS data")
+                    logging.info(f"Activity ID {activity.get('activityId')} is a climbing/bouldering activity - processing FIT file even without GPS data")
                 else:
                     logging.warning(f"Activity ID {activity.get('activityId')} got no GPS data - yet, activity FIT file data will be processed as ALWAYS_PROCESS_FIT_FILES is on")
             activity_with_gps_id_dict[activity.get('activityId')] = activity_type_key
@@ -771,7 +771,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "ActivityName": activity_type,
                                     "Activity_ID": activityID,
                                     "Sport": str(session_record.get('sport', None)), # Avoid partial write error 400 see #152#issuecomment-3084539416
-                                    "Sub_Sport": session_record.get('sub_sport', None),
+                                    # Sub_Sport removed - causes field type conflict (exists as both int and string in DB)
                                     "Pool_Length": session_record.get('pool_length', None),
                                     "Pool_Length_Unit": session_record.get('pool_length_unit', None),
                                     "Lengths": session_record.get('num_laps', None),
@@ -852,13 +852,21 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                             }
                             points_list.append(point)
 
-                    # Process Indoor Climbing specific data from message 312
-                    if 'climbing' in activity_type.lower() or any(session.get('sport') in ['climbing', 'rock_climbing', 'indoor_climbing'] for session in all_sessions_list):
-                        logging.info(f"Processing : Indoor Climbing activity detected for Activity ID {activityID}")
-                        # Extract climbing routes from FIT file message 312
+                    # Process Indoor Climbing and Bouldering specific data from message 312
+                    is_bouldering = 'bouldering' in activity_type.lower() or any(session.get('sport') == 'bouldering' for session in all_sessions_list)
+                    is_climbing = 'climbing' in activity_type.lower() or any(session.get('sport') in ['climbing', 'rock_climbing', 'indoor_climbing'] for session in all_sessions_list)
+
+                    if is_bouldering or is_climbing:
                         # Create a fresh buffer from the fit_data as the previous buffer may be closed
-                        climbing_fit_buffer = io.BytesIO(fit_data)
-                        climbing_points = get_climbing_stats(activityID, climbing_fit_buffer)
+                        fit_buffer = io.BytesIO(fit_data)
+
+                        if is_bouldering:
+                            logging.info(f"Processing : Bouldering activity detected for Activity ID {activityID}")
+                            climbing_points = get_bouldering_stats(activityID, fit_buffer)
+                        else:
+                            logging.info(f"Processing : Climbing activity detected for Activity ID {activityID}")
+                            climbing_points = get_climbing_stats(activityID, fit_buffer)
+
                         points_list.extend(climbing_points)
 
                     if KEEP_FIT_FILES:
@@ -1350,6 +1358,114 @@ def get_climbing_stats(activity_id, fit_file_buffer):
 
     except Exception as err:
         logging.error(f"Error extracting climbing stats from FIT file for activity {activity_id}: {err}")
+        import traceback
+        traceback.print_exc()
+
+    return points_list
+
+
+def get_bouldering_stats(activity_id, fit_file_buffer):
+    """
+    Extract bouldering problem data from FIT file message 312.
+
+    Args:
+        activity_id: The Garmin activity ID
+        fit_file_buffer: BytesIO buffer containing the FIT file data
+
+    Returns:
+        List of InfluxDB points for bouldering problems
+    """
+
+    def map_grade_to_v_scale(grade_value):
+        """
+        Map numeric grade value to V-scale bouldering grade.
+        V-scale: 1=V0, 2=V1, 3=V2, ... 17=V16, etc.
+
+        Args:
+            grade_value: Numeric grade from FIT file (field 70)
+
+        Returns:
+            String representation of V-grade (e.g., "V3")
+        """
+        if grade_value is None or grade_value < 1:
+            return None
+
+        # V-scale starts at V0 for value 1
+        v_grade = grade_value - 1
+        return f"V{v_grade}"
+
+    points_list = []
+
+    try:
+        from fitparse import FitFile
+
+        # Parse the FIT file
+        fitfile = FitFile(fit_file_buffer)
+        fitfile.parse()
+
+        # Get message 312 (bouldering problem data)
+        messages_312 = [record.get_values() for record in fitfile.get_messages('unknown_312')]
+
+        if not messages_312:
+            logging.debug(f"No message 312 found in FIT file for activity {activity_id}")
+            return points_list
+
+        logging.info(f"Processing : Found {len(messages_312)} bouldering records in message 312 for activity {activity_id}")
+
+        # Get activity start time for reference
+        sessions = [record.get_values() for record in fitfile.get_messages('session')]
+        activity_start_time = sessions[0].get('start_time').replace(tzinfo=pytz.UTC) if sessions else None
+
+        # Process each bouldering record
+        for climb_msg in messages_312:
+            climb_type = climb_msg.get('unknown_0')  # 9 = Climb, 10 = Rest
+
+            # Skip rest periods - only process boulder problems
+            if climb_type != 9:
+                continue
+
+            grade_value = climb_msg.get('unknown_70')  # Grade field
+            duration_ms = climb_msg.get('unknown_1')  # Duration in milliseconds
+            max_hr = climb_msg.get('unknown_16')  # Max heart rate
+            status = climb_msg.get('unknown_71')  # Completed or Attempted
+            timestamp_raw = climb_msg.get('unknown_27')  # Garmin timestamp
+
+            # Convert timestamp (Garmin time format: seconds since 1989-12-31)
+            if timestamp_raw:
+                climb_time = (datetime(1989, 12, 31) + timedelta(seconds=timestamp_raw)).replace(tzinfo=pytz.UTC)
+            elif activity_start_time:
+                climb_time = activity_start_time
+            else:
+                continue  # Skip if no timestamp available
+
+            # Map grade to V-scale
+            grade = map_grade_to_v_scale(grade_value)
+
+            # Convert duration from milliseconds to seconds
+            duration_seconds = round(duration_ms / 1000.0, 0) if duration_ms is not None else None
+
+            # Create InfluxDB point for bouldering
+            point = {
+                "measurement": "BoulderProblems",
+                "time": climb_time.isoformat(),
+                "tags": {
+                    "ActivityID": activity_id
+                },
+                "fields": {
+                    "Duration": duration_seconds,
+                    "MaxHeartRate": max_hr if max_hr is not None else None,
+                    "Grade": grade,
+                    "Status": "Completed" if status == 3 else "Attempted"
+                }
+            }
+            points_list.append(point)
+
+        # Log summary
+        problems = sum(1 for m in messages_312 if m.get('unknown_0') == 9)
+        logging.info(f"Success : Extracted {problems} boulder problems from activity {activity_id}")
+
+    except Exception as err:
+        logging.error(f"Error extracting bouldering stats from FIT file for activity {activity_id}: {err}")
         import traceback
         traceback.print_exc()
 
