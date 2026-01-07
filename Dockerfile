@@ -1,22 +1,15 @@
 # ============================================
 # STAGE 1: Builder - Install all dependencies
 # ============================================
-FROM python:3.13-alpine AS builder
+FROM ghcr.io/astral-sh/uv:0.6.17-python3.13-bookworm-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install build dependencies for packages with C extensions
-# gcc, musl-dev, linux-headers: Required for numpy, msgpack, pydantic-core, charset-normalizer
-RUN apk add --no-cache \
-    gcc \
-    musl-dev \
-    linux-headers \
-    g++ \
-    libffi-dev
-
-# Install uv (Python package installer)
-COPY --from=ghcr.io/astral-sh/uv:0.6.17 /uv /usr/local/bin/uv
+# Install build dependencies (only needed during build)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
@@ -33,21 +26,21 @@ RUN uv pip install --system setuptools wheel && \
 # ============================================
 # STAGE 2: Runtime - Minimal final image
 # ============================================
-FROM python:3.13-alpine AS runtime
+FROM python:3.13-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 # Tell uv to use system Python instead of creating venvs
 ENV UV_PROJECT_ENVIRONMENT=/usr/local
 
-# Install runtime dependencies for compiled packages
-# libstdc++: Required by numpy, pandas
-# libgcc: Required by most C extensions
-# bind-tools: Improves DNS resolution in Alpine/musl
-# ca-certificates: Required for HTTPS connections
-RUN apk add --no-cache libstdc++ libgcc libffi bind-tools ca-certificates
+# Install only runtime dependencies (no build tools)
+# This keeps the image small while maintaining functionality
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy uv for convenience (though not needed since packages are pre-installed)
+# Copy uv for convenience
 COPY --from=ghcr.io/astral-sh/uv:0.6.17 /uv /usr/local/bin/uv
 
 WORKDIR /app
@@ -60,8 +53,8 @@ COPY src /app/
 COPY pyproject.toml uv.lock /app/
 
 # Create non-root user
-RUN addgroup -g 1000 appuser && \
-    adduser -u 1000 -G appuser -s /bin/sh -D appuser && \
+RUN groupadd --gid 1000 appuser && \
+    useradd --uid 1000 --gid appuser --shell /bin/bash --create-home appuser && \
     chown -R appuser:appuser /app
 
 USER appuser
