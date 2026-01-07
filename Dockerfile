@@ -43,7 +43,9 @@ ENV UV_PROJECT_ENVIRONMENT=/usr/local
 # Install runtime dependencies for compiled packages
 # libstdc++: Required by numpy, pandas
 # libgcc: Required by most C extensions
-RUN apk add --no-cache libstdc++ libgcc libffi
+# bind-tools: Improves DNS resolution in Alpine/musl
+# ca-certificates: Required for HTTPS connections
+RUN apk add --no-cache libstdc++ libgcc libffi bind-tools ca-certificates
 
 # Copy uv for convenience (though not needed since packages are pre-installed)
 COPY --from=ghcr.io/astral-sh/uv:0.6.17 /uv /usr/local/bin/uv
